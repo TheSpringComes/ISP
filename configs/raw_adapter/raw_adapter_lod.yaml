@@ -1,0 +1,62 @@
+# RAW-Adapter + Sparse-RCNN(placeholder) on LOD dataset
+# 训练策略: ISP + Detector 端到端联合训练
+
+experiment:
+  name: raw_adapter_lod
+  work_dir: work_dirs/raw_adapter_lod
+
+data:
+  dataset: LOD
+  img_dir: data/LOD/RAW_dark
+  train_ann: data/LOD/annotations/lod_dark_train.json
+  val_ann: data/LOD/annotations/lod_dark_val.json
+  classes:
+    - bicycle
+    - bus
+    - car
+    - motorbike
+    - person
+    - dog
+    - cat
+    - bottle
+  num_classes: 8
+  img_size: 512
+  input_channels: 4
+  raw_suffix: ".png"
+  num_workers: 4
+
+isp:
+  type: RAWAdapter
+  in_channels: 4
+  backbone_channels:       # ResNet-50 FPN 各层通道数
+    - 256
+    - 512
+    - 1024
+    - 2048
+  adapter_dim: 64
+  use_qal: true            # Query Adaptive Learning
+
+detector:
+  type: SparseRCNN
+  num_classes: 8
+  pretrained: true
+  freeze: false            # RAW-Adapter: detector 不冻结, 联合训练
+
+model:
+  use_model_adapter: true   # RAW-Adapter 的核心: model-level adapter
+
+training:
+  mode: e2e                 # 端到端联合训练
+  max_epochs: 24
+  batch_size: 4
+  optimizer:
+    type: AdamW
+    lr: 0.0001
+    weight_decay: 0.05
+  scheduler:
+    type: CosineAnnealingLR
+    T_max: 24
+    eta_min: 0.000001
+  log_interval: 20
+  eval_interval: 2
+  grad_clip: 10.0

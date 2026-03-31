@@ -1,0 +1,67 @@
+# AdaptiveISP + YOLOv3(placeholder) on LOD dataset
+# 训练策略: RL agent 选择 ISP pipeline, detector 冻结
+
+experiment:
+  name: adaptive_isp_lod
+  work_dir: work_dirs/adaptive_isp_lod
+
+data:
+  dataset: LOD
+  img_dir: data/LOD/RAW_dark
+  train_ann: data/LOD/annotations/lod_dark_train.json
+  val_ann: data/LOD/annotations/lod_dark_val.json
+  # 如果你用 VOC XML 标注, 取消注释以下两行并注释上面两行:
+  # train_xml_dir: data/LOD/xml_annotations/train
+  # val_xml_dir: data/LOD/xml_annotations/val
+  classes:
+    - bicycle
+    - bus
+    - car
+    - motorbike
+    - person
+    - dog
+    - cat
+    - bottle
+  num_classes: 8
+  img_size: 512
+  input_channels: 4       # 4=RGGB packed, 3=demosaiced
+  raw_suffix: ".png"
+  num_workers: 4
+
+isp:
+  type: AdaptiveISP
+  in_channels: 4
+  max_stages: 5
+  cost_penalty: 0.01
+  agent_hidden_dim: 256
+
+detector:
+  type: YOLOv3
+  num_classes: 8
+  pretrained: true
+  freeze: true             # AdaptiveISP: detector 冻结
+  input_channels: 3
+
+model:
+  use_model_adapter: false  # AdaptiveISP 不需要 model-level adapter
+
+training:
+  mode: rl                  # rl | e2e
+  max_epochs: 24
+  batch_size: 4
+  # ISP 参数优化器
+  optimizer:
+    type: Adam
+    lr: 0.001
+    weight_decay: 0.0001
+  # RL agent 优化器 (单独)
+  rl_optimizer:
+    type: Adam
+    lr: 0.0003
+  scheduler:
+    type: CosineAnnealingLR
+    T_max: 24
+    eta_min: 0.00001
+  log_interval: 20
+  eval_interval: 2
+  grad_clip: 10.0
