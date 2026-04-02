@@ -1,90 +1,206 @@
-"""RL Agent for AdaptiveISP.
+"""
+AdaptiveISP RL Agent.
 
-轻量级策略网络, 在每个 stage 根据当前处理结果选择下一步 ISP 操作.
-使用 REINFORCE / PPO 训练.
+论文架构 (Figure 11 / Section 3.2):
+  1. 共享 Feature Backbone (轻量 CNN, 从当前 stage 图像提取 state)
+  2. Module Selection Network (softmax → 选择下一个 ISP 模块)
+  3. Parameter Prediction Networks (每个模块一个小 head, 预测该模块参数)
+  4. Value Network (PPO baseline)
+
+训练: PPO / REINFORCE
+  - Reward = detection mAP (或 -detection_loss)
+  - Cost  = stage_count * cost_penalty (鼓励短 pipeline)
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Categorical
+from typing import Tuple, List, Dict
+
+from .isp_ops import ISP_MODULES, NUM_OPS, MAX_PARAMS, STOP_IDX
 
 
-class StateEncoder(nn.Module):
-    """从当前图像提取紧凑的状态向量 (用于 RL agent 决策)."""
+class SharedBackbone(nn.Module):
+    """轻量 CNN 从当前 stage 图像提取 state vector.
 
-    def __init__(self, in_channels: int = 3, state_dim: int = 128):
+    论文: "lightweight RL agent takes the processing output from the
+    previous stage as input" — 用全局池化得到紧凑特征.
+    """
+
+    def __init__(self, state_dim: int = 256):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.AdaptiveAvgPool2d(16),
-            nn.Flatten(),
-            nn.Linear(in_channels * 16 * 16, state_dim),
-            nn.ReLU(inplace=True),
+        self.conv = nn.Sequential(
+            nn.Conv2d(3, 32, 3, stride=2, padding=1),   # /2
+            nn.LeakyReLU(0.2, True),
+            nn.Conv2d(32, 64, 3, stride=2, padding=1),  # /4
+            nn.LeakyReLU(0.2, True),
+            nn.Conv2d(64, 128, 3, stride=2, padding=1), # /8
+            nn.LeakyReLU(0.2, True),
+            nn.AdaptiveAvgPool2d(4),                     # 128x4x4
         )
+        self.fc = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(128 * 4 * 4, state_dim),
+            nn.LeakyReLU(0.2, True),
+        )
+        self.state_dim = state_dim
 
     def forward(self, img: torch.Tensor) -> torch.Tensor:
-        return self.net(img)
+        """(B,3,H,W) -> (B, state_dim)."""
+        return self.fc(self.conv(img))
+
+
+class ModuleSelector(nn.Module):
+    """Module Selection Network — 输出 softmax 概率分布.
+
+    论文: "The activation function for the module selection network
+    is softmax, with the number of outputs corresponding to the
+    number of ISP modules."
+    """
+
+    def __init__(self, state_dim: int, num_modules: int = NUM_OPS):
+        super().__init__()
+        self.head = nn.Sequential(
+            nn.Linear(state_dim, 128),
+            nn.ReLU(True),
+            nn.Linear(128, num_modules),
+        )
+
+    def forward(self, state: torch.Tensor) -> torch.Tensor:
+        """返回 logits (B, num_modules)."""
+        return self.head(state)
+
+
+class ParameterPredictor(nn.Module):
+    """Per-module 参数预测 head.
+
+    论文: "Parameter prediction networks share a common feature
+    extraction backbone. The activation function and the number
+    of outputs from parameter prediction networks are specific
+    to each module."
+
+    每个 ISP module 有自己的小 MLP head, 预测该模块所需参数.
+    """
+
+    def __init__(self, state_dim: int, num_params: int):
+        super().__init__()
+        if num_params == 0:
+            self.head = None
+        else:
+            self.head = nn.Sequential(
+                nn.Linear(state_dim, 64),
+                nn.ReLU(True),
+                nn.Linear(64, num_params),
+            )
+        self.num_params = num_params
+
+    def forward(self, state: torch.Tensor) -> torch.Tensor:
+        """(B, state_dim) -> (B, num_params) or None."""
+        if self.head is None:
+            return None
+        return self.head(state)
+
+
+class ValueHead(nn.Module):
+    """State value estimator for PPO advantage computation."""
+
+    def __init__(self, state_dim: int):
+        super().__init__()
+        self.head = nn.Sequential(
+            nn.Linear(state_dim, 128),
+            nn.ReLU(True),
+            nn.Linear(128, 1),
+        )
+
+    def forward(self, state: torch.Tensor) -> torch.Tensor:
+        return self.head(state).squeeze(-1)
 
 
 class RLAgent(nn.Module):
-    """ISP Pipeline 选择的 RL Agent.
+    """AdaptiveISP 的完整 RL Agent.
 
-    输入: 当前 stage 的图像特征 (state)
-    输出: 选择哪个 ISP 操作 (action)
+    每个 stage:
+      1. backbone(current_image) -> state
+      2. selector(state) -> module_logits
+      3. sample module from Categorical(logits)
+      4. param_heads[module](state) -> params
+      5. 返回 (action, params, log_prob, value)
     """
 
-    def __init__(
-        self,
-        in_channels: int = 3,
-        num_actions: int = 8,
-        state_dim: int = 128,
-        hidden_dim: int = 256,
-    ):
+    def __init__(self, state_dim: int = 256):
         super().__init__()
-        self.state_encoder = StateEncoder(in_channels, state_dim)
-        self.policy = nn.Sequential(
-            nn.Linear(state_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, num_actions),
-        )
-        self.value = nn.Sequential(
-            nn.Linear(state_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, 1),
-        )
 
-    def extract_state(self, img: torch.Tensor) -> torch.Tensor:
-        """从批次图像提取 state. (B, 3, H, W) -> (B, state_dim)"""
-        return self.state_encoder(img)
+        self.backbone = SharedBackbone(state_dim)
+        self.selector = ModuleSelector(state_dim, NUM_OPS)
+        self.value_head = ValueHead(state_dim)
 
-    def select_action(
-        self, state: torch.Tensor, deterministic: bool = False
-    ):
-        """选择动作.
+        # 每个 ISP module 的参数预测 head
+        self.param_heads = nn.ModuleList([
+            ParameterPredictor(state_dim, cls.num_params)
+            for cls in ISP_MODULES
+        ])
 
-        Returns:
-            actions: (B,) int tensor
-            log_probs: (B,) log probability
-            values: (B,) state value (for PPO)
+    def forward(
+        self,
+        img: torch.Tensor,
+        deterministic: bool = False,
+    ) -> Dict[str, torch.Tensor]:
         """
-        logits = self.policy(state)
+        Args:
+            img: (B,3,H,W)
+            deterministic: True=推理 (argmax), False=训练 (sample)
+
+        Returns dict:
+            action   : (B,) int, 选择的模块 index
+            params   : (B, MAX_PARAMS) 对应模块的参数 (多余位填 0)
+            log_prob : (B,) 动作 log 概率
+            value    : (B,) state value
+            logits   : (B, NUM_OPS) 原始 logits
+            state    : (B, state_dim)
+        """
+        state = self.backbone(img)
+
+        # Module selection
+        logits = self.selector(state)
         dist = Categorical(logits=logits)
 
         if deterministic:
-            actions = logits.argmax(dim=-1)
+            action = logits.argmax(dim=-1)
         else:
-            actions = dist.sample()
+            action = dist.sample()
 
-        log_probs = dist.log_prob(actions)
-        values = self.value(state).squeeze(-1)
+        log_prob = dist.log_prob(action)
+        value = self.value_head(state)
 
-        return actions, log_probs, values
+        # Parameter prediction for selected modules
+        B = img.shape[0]
+        params = img.new_zeros(B, MAX_PARAMS)
+        for op_idx in range(NUM_OPS):
+            mask = (action == op_idx)
+            if mask.any() and self.param_heads[op_idx].head is not None:
+                pred = self.param_heads[op_idx](state[mask])   # (n, np)
+                np_ = pred.shape[1]
+                params[mask, :np_] = pred
 
-    def evaluate_actions(self, state: torch.Tensor, actions: torch.Tensor):
-        """评估已有 actions 的 log_prob 和 entropy (PPO 需要)."""
-        logits = self.policy(state)
+        return {
+            'action': action,
+            'params': params,
+            'log_prob': log_prob,
+            'value': value,
+            'logits': logits,
+            'state': state,
+        }
+
+    def evaluate_action(
+        self,
+        state: torch.Tensor,
+        action: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """PPO 需要: 根据存储的 state 和 action 重新算 log_prob, entropy, value."""
+        logits = self.selector(state)
         dist = Categorical(logits=logits)
-        log_probs = dist.log_prob(actions)
+        log_prob = dist.log_prob(action)
         entropy = dist.entropy()
-        values = self.value(state).squeeze(-1)
-        return log_probs, entropy, values
+        value = self.value_head(state)
+        return log_prob, entropy, value

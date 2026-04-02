@@ -1,157 +1,194 @@
-"""AdaptiveISP — RL-driven 动态 ISP Pipeline.
+"""
+AdaptiveISP — 完整实现.
 
-核心思路:
-  1. Demosaic (固定): RGGB 4ch -> RGB 3ch
-  2. RL Agent 逐 stage 选择操作: WB / CCM / Gamma / Denoise / Desaturate / Sharpen / ToneMap / Stop
-  3. 每个 stage 选一个操作, "Stop" 表示 pipeline 终止
-  4. Detection loss 反传优化 ISP 参数, RL 优化 pipeline 选择
+Pipeline:
+  1. DemosaicNet: raw (B,4,H,W) -> linear RGB (B,3,H,W)   [固定首步]
+  2. for stage in 1..max_stages:
+       agent 观察当前图像 -> 选择模块 M_i + 预测参数 Θ_i
+       if M_i == Identity: break (pipeline 终止)
+       x = M_i(x, Θ_i)
+  3. 输出最终 RGB
 
-参考: AdaptiveISP: Learning an Adaptive Image Signal Processor for Object Detection (NeurIPS 2024)
+训练:
+  - ISP module 内部参数 + demosaic: 通过 detection loss 梯度反传更新
+  - RL agent (selector + param heads): PPO 更新
+    reward = -det_loss (或 mAP improvement)
+    cost   = num_stages * cost_penalty
 """
 
 import torch
 import torch.nn as nn
-from typing import Dict, List
+import torch.nn.functional as F
+from typing import Dict, List, Optional
 
 from ..base_isp import BaseISP
 from .isp_ops import (
-    DemosaicOp, WhiteBalanceOp, ColorCorrectionOp, GammaOp,
-    DenoiseOp, DesaturationOp, SharpenOp, ToneMappingOp, IdentityOp,
+    DemosaicNet, ISP_MODULES, ISP_NAMES, NUM_OPS,
+    STOP_IDX, MAX_PARAMS,
 )
 from .rl_agent import RLAgent
 
 
 class AdaptiveISPModule(BaseISP):
+    """AdaptiveISP: RL-driven scene-adaptive ISP pipeline.
+
+    Args:
+        in_channels:      输入 RAW 通道数 (4 for RGGB)
+        max_stages:       最大 pipeline 长度
+        cost_penalty:     每增加一个 stage 的 reward 惩罚
+        agent_state_dim:  RL agent state 向量维度
+    """
 
     def __init__(
         self,
         in_channels: int = 4,
         max_stages: int = 5,
         cost_penalty: float = 0.01,
-        agent_hidden_dim: int = 256,
+        agent_state_dim: int = 256,
     ):
         super().__init__()
         self.max_stages = max_stages
         self.cost_penalty = cost_penalty
 
-        # 固定的 demosaic: 4ch -> 3ch
-        self.demosaic = DemosaicOp()
+        # 固定首步: demosaic
+        self.demosaic = DemosaicNet()
 
-        # ISP 操作库 (不含 demosaic 和 identity)
-        self.op_names = ['wb', 'ccm', 'gamma', 'denoise',
-                         'desaturate', 'sharpen', 'tonemap', 'identity']
-        self.ops = nn.ModuleList([
-            WhiteBalanceOp(),
-            ColorCorrectionOp(),
-            GammaOp(),
-            DenoiseOp(),
-            DesaturationOp(),
-            SharpenOp(),
-            ToneMappingOp(),
-            IdentityOp(),  # index 7 = stop
-        ])
-        self.stop_idx = len(self.ops) - 1
+        # ISP 操作库 (nn.ModuleList 确保参数被注册)
+        self.ops = nn.ModuleList([cls() for cls in ISP_MODULES])
 
         # RL Agent
-        self.agent = RLAgent(
-            in_channels=3,
-            num_actions=len(self.ops),
-            hidden_dim=agent_hidden_dim,
-        )
+        self.agent = RLAgent(state_dim=agent_state_dim)
 
-        # RL 训练中间数据
-        self._rl_data = []
+        # 训练期间的 rollout buffer
+        self._rollout: List[Dict] = []
+        self._num_stages_used: int = 0
 
+    # ----------------------------------------------------------
+    # Forward
+    # ----------------------------------------------------------
     def forward(self, raw: torch.Tensor) -> torch.Tensor:
-        """(B, 4, H, W) -> (B, 3, H, W)"""
+        """
+        Args:
+            raw: (B, 4, H, W) RGGB packed Bayer
+        Returns:
+            rgb: (B, 3, H, W) 最终处理后的 RGB
+        """
         self._intermediate_features = []
-        self._rl_data = []
+        self._rollout = []
 
-        # Step 1: Demosaic
+        # Step 0: Demosaic (固定)
         x = self.demosaic(raw)
         self._intermediate_features.append(x)
 
-        # Step 2: RL-driven pipeline
-        for stage in range(self.max_stages):
-            state = self.agent.extract_state(x.detach())
-            actions, log_probs, values = self.agent.select_action(
-                state, deterministic=not self.training
+        # Step 1..N: RL-driven ISP stages
+        for stage_idx in range(self.max_stages):
+            agent_out = self.agent(
+                x.detach() if self.training else x,
+                deterministic=not self.training,
             )
 
-            self._rl_data.append({
-                'actions': actions,
-                'log_probs': log_probs,
-                'values': values,
-                'state': state,
-            })
+            actions = agent_out['action']      # (B,)
+            params  = agent_out['params']      # (B, MAX_PARAMS)
 
-            # 检查是否所有 batch 都选了 stop
-            if (actions == self.stop_idx).all():
+            # 保存 rollout (训练时用于 RL loss)
+            self._rollout.append(agent_out)
+
+            # 全部选了 stop → 终止
+            if (actions == STOP_IDX).all():
                 break
 
-            # 对每个 batch item 应用各自选择的操作
+            # 对 batch 中不同样本应用各自选择的操作
             x_new = torch.zeros_like(x)
             for op_idx, op in enumerate(self.ops):
-                mask = (actions == op_idx).float().view(-1, 1, 1, 1)
-                if mask.sum() > 0:
-                    x_new = x_new + mask * op(x)
+                mask = (actions == op_idx)
+                if not mask.any():
+                    continue
+                np_ = ISP_MODULES[op_idx].num_params
+                op_params = params[mask, :np_] if np_ > 0 else None
+                x_new[mask] = op(x[mask], op_params)
+
+            # stop 的样本保持不变
+            stop_mask = (actions == STOP_IDX)
+            if stop_mask.any():
+                x_new[stop_mask] = x[stop_mask]
 
             x = x_new.clamp(0, 1)
             self._intermediate_features.append(x)
 
+        self._num_stages_used = len(self._rollout)
         return x
 
-    def get_rl_loss(self, reward: torch.Tensor) -> torch.Tensor:
-        """计算 RL policy gradient loss.
+    # ----------------------------------------------------------
+    # RL Loss (PPO-style)
+    # ----------------------------------------------------------
+    def compute_rl_loss(
+        self,
+        reward: torch.Tensor,
+        ppo_clip: float = 0.2,
+        entropy_coef: float = 0.01,
+        value_coef: float = 0.5,
+    ) -> torch.Tensor:
+        """计算 PPO 风格的 RL 损失.
 
         Args:
-            reward: (B,) per-image reward (e.g., -detection_loss or mAP)
+            reward: (B,) per-image reward (通常 = -det_loss)
+            ppo_clip: PPO clip ratio ε
+            entropy_coef: entropy bonus 系数
+            value_coef: value loss 系数
+
         Returns:
             rl_loss: scalar
         """
-        if len(self._rl_data) == 0:
-            return torch.tensor(0.0, device=reward.device)
+        if len(self._rollout) == 0:
+            return reward.new_tensor(0.0)
 
-        policy_loss = torch.tensor(0.0, device=reward.device)
-        value_loss = torch.tensor(0.0, device=reward.device)
-        entropy_bonus = torch.tensor(0.0, device=reward.device)
+        # Cost penalty: 鼓励短 pipeline
+        cost = len(self._rollout) * self.cost_penalty
+        adj_reward = reward - cost
 
-        # Cost penalty: 鼓励更短的 pipeline
-        cost = len(self._rl_data) * self.cost_penalty
-        adjusted_reward = reward - cost
+        total_loss = reward.new_tensor(0.0)
+        for step_data in self._rollout:
+            log_prob = step_data['log_prob']
+            value    = step_data['value']
+            state    = step_data['state']
+            action   = step_data['action']
 
-        for step_data in self._rl_data:
-            advantage = adjusted_reward - step_data['values'].detach()
+            advantage = (adj_reward - value.detach())
 
-            # Policy gradient
-            policy_loss -= (step_data['log_probs'] * advantage).mean()
+            # Re-evaluate for PPO (如果需要更新多 epoch)
+            new_log_prob, entropy, new_value = self.agent.evaluate_action(
+                state.detach(), action.detach()
+            )
+
+            # PPO clipped objective
+            ratio = torch.exp(new_log_prob - log_prob.detach())
+            surr1 = ratio * advantage
+            surr2 = torch.clamp(ratio, 1 - ppo_clip, 1 + ppo_clip) * advantage
+            policy_loss = -torch.min(surr1, surr2).mean()
 
             # Value loss
-            value_loss += F.mse_loss(step_data['values'],
-                                     adjusted_reward.detach())
+            value_loss = F.mse_loss(new_value, adj_reward.detach())
 
-            # Entropy (鼓励探索)
-            logits = self.agent.policy(step_data['state'])
-            dist = torch.distributions.Categorical(logits=logits)
-            entropy_bonus -= dist.entropy().mean()
+            # Entropy bonus (鼓励探索)
+            entropy_loss = -entropy.mean()
 
-        total = policy_loss + 0.5 * value_loss + 0.01 * entropy_bonus
-        return total / max(len(self._rl_data), 1)
+            total_loss = total_loss + policy_loss \
+                         + value_coef * value_loss \
+                         + entropy_coef * entropy_loss
 
+        return total_loss / max(len(self._rollout), 1)
+
+    # ----------------------------------------------------------
+    # Info
+    # ----------------------------------------------------------
     def get_isp_config(self) -> Dict:
-        if not self._rl_data:
-            return {}
+        if not self._rollout:
+            return {'pipeline': [], 'num_stages': 0}
         pipeline = []
-        for step in self._rl_data:
-            actions = step['actions']
-            # 取 batch 中第一个样本的 action
-            a = actions[0].item()
-            pipeline.append(self.op_names[a])
+        for step in self._rollout:
+            a = step['action'][0].item()
+            pipeline.append(ISP_NAMES[a])
         return {
             'pipeline': pipeline,
             'num_stages': len(pipeline),
         }
-
-
-# 需要 F 用于 get_rl_loss
-import torch.nn.functional as F

@@ -152,12 +152,12 @@ class DetectionEvaluator:
                 else:
                     all_tp.append(False)
 
-        if n_gt == 0:
+        if n_gt == 0 or len(all_tp) == 0:
             return 0.0
 
         # 按 score 排序
-        all_scores = np.array(all_scores)
-        all_tp = np.array(all_tp)
+        all_scores = np.array(all_scores, dtype=np.float64)
+        all_tp = np.array(all_tp, dtype=np.bool_)
         order = np.argsort(-all_scores)
         all_tp = all_tp[order]
 

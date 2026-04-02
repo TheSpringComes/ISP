@@ -175,11 +175,11 @@ class Trainer:
 
             # --- 更新 RL agent ---
             if (self.rl_optimizer is not None
-                    and hasattr(self.model.isp, 'get_rl_loss')):
+                    and hasattr(self.model.isp, 'compute_rl_loss')):
                 # Reward: 负 detection loss (越小越好)
                 B = images.shape[0]
                 reward = -det_loss.detach().expand(B)
-                rl_loss = self.model.isp.get_rl_loss(reward)
+                rl_loss = self.model.isp.compute_rl_loss(reward)
 
                 self.rl_optimizer.zero_grad()
                 rl_loss.backward()
